@@ -1,0 +1,44 @@
+val graph = GraphLoader.edgeListFile(sc, "./graphx/data/users.txt", true).partitionBy(PartitionStrategy.RandomVertexCut)
+val g = graph.groupEdges((a, b) => a).cache()
+val nbrSets: VertexRDD[VertexSet] =
+    g.collectNeighborIds(EdgeDirection.Either).mapValues{
+      (vid, nbrs) => {
+        val set = VertexSet(4)
+        val it = nbrs.iterator
+        while(it.hasnext){
+          val id = it.next()
+	  if(id != vid) set.add(id)
+        }
+        set
+      }
+    }
+val setGraph = g.outerJoinVertices(nbrSets){
+  (vid, _, set) => set.getOrElse(null)
+}
+def CountMap(triplet: EdgeContext[VertexSet, Int, Int]){
+    assert(triplet.srcAttr != null)
+    assert(triplet.dstAttr != null)
+    val (smallSet, largeSet) = {
+      if(triplet.srcAttr.size < triplet.dstAttr.size) triplet.srcAttr
+      else triplet.dstAttr
+    }
+    val it = smallSet.iterator
+    val count = 0;
+    while(it.hasnext){
+      val id = it.next()
+      if(id != triplet.srcId && id != triplet.dstId && largeSet.contains(id))
+        count++;
+    }
+    triplet.sendToDst(count)
+    triplet.sendToSrc(count)
+}
+val counters: VertexRDD[Int] = setGraph.aggregateMessages(CountMap, _ + _)
+g.outerJoinVertices(counters){
+  (vid, _, count: Option[Int]) => {
+    val db = count.getOrElse(0) 
+    assert( (db & 1) == 1)
+    db / 2
+  }
+}
+ 
+    

@@ -1,0 +1,67 @@
+import org.apache.spark._
+import org.apache.spark.graphx._
+import org.apache.spark.rdd.RDD
+import scala.reflect.ClassTag
+
+object PageRankPregel{
+  def apply(graph: Graph[(Double, Double), Double],
+       initialMsg: Double,
+       maxIterations: Int = Int.MaxValue,
+       tol: Double = 0.0001,
+       activeDir: EdgeDirection = EdgeDirection.Out)
+      (vprog: (VertexId, (Double, Double), Double) => (Double, Double),
+       sendMsg: EdgeTriplet[(Double, Double), Double] => Iterator[(VertexId, Double)],
+       mergeMsg: (Double, Double) => Double)
+    : Graph[(Double, Double), Double] =
+  {
+    var g  = graph.mapVertices( (vid, vdata) => vprog(vid, vdata, initialMsg)).cache()
+    // compute the message
+    var error = Math.sqrt(g.vertices.reduce((a: (VertexId, (Double, Double)), b: (VertexId, (Double, Double))) => (0,(0,  Math.pow(a._2._2, 2) + Math.pow(b._2._2, 2))))._2._2)
+    var messages = g.mapReduceTriplets(sendMsg, mergeMsg)
+    
+    // Loop until no messages remain or maxIterations is achieved
+    var i = 0
+    while (error > tol && i < maxIterations) {
+       // Receive the messages: ----------------------------------------------
+       val newVerts = g.vertices.innerJoin(messages)(vprog).cache()
+       error = Math.sqrt(newVerts.reduce((a: (VertexId, (Double, Double)), b: (VertexId, (Double, Double))) => (0, (0, Math.pow(a._2._2, 2) + Math.pow(b._2._2, 2))))._2._2)
+       // Merge the new vertex values back into the graph
+       g = g.outerJoinVertices(newVerts){
+          (vid, old, newOpt) => newOpt.getOrElse(old)
+       }.cache()
+      
+       // Send Messages: --------------------------------------------------
+   
+       messages = g.mapReduceTriplets(sendMsg, mergeMsg, Some((newVerts, activeDir))).cache()
+       i += 1
+     }
+     g
+  }
+}
+
+val graphPR = GraphLoader.edgeListFile(sc, "graphx/data/followers.txt")
+val Num = graphPR.numVertices
+val d = 0.85
+val mgi = 1.0 / Num
+val damp = (1.0 - d)/ Num
+val tol = 0.0001
+
+val initialGraphPR: Graph[(Double, Double), Double] = graphPR.outerJoinVertices(graphPR.outDegrees){ (id, vdata, outdeg) => outdeg match{
+    case Some(outdeg) => d / outdeg
+    case None => 0.0
+    }
+}.mapTriplets(tr => tr.srcAttr + damp ).mapVertices((id, vdata) => (0.0, 0.0)).cache() //initilize all edge as d/outdeg of src, 
+
+def receiveMessage(id: VertexId, vdata: (Double, Double),  msg: Double): (Double, Double) ={
+  val (curData, diff) = vdata
+  val newData = damp * curData + msg // updating according to the rule of (1 - d)/N + d*(vData / outdeg)
+  (newData, newData - curData)
+}
+
+def sendMessage(tr: EdgeTriplet[(Double,Double), Double]) = {
+    Iterator((tr.dstId, tr.srcAttr._1 * tr.attr)) // where message = vData / outdeg
+}
+
+def combiner(a: Double, b: Double): Double = a + b
+
+val ranks = PageRankPregel(initialGraphPR, mgi)(receiveMessage, sendMessage, combiner).vertices
